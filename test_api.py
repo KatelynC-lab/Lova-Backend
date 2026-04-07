@@ -18,16 +18,16 @@ logger = logging.getLogger(__name__)
 # 1. Load secrets and initialize the server
 load_dotenv()
 besttime_api_key = os.getenv("BESTTIME_API_KEY")
-google_api_key = os.getenv("GOOGLE_API_KEY")
-directions_api_key = os.getenv("DIRECTIONS_API_KEY")
+# NOTE: google_api_key and directions_api_key are no longer needed for search
+# but keep them if you still intend to use Google for the Map Polyline/Routing.
 
-app = FastAPI(title="Lova Backend API")
+app = FastAPI(title="Lova Backend API (OSM Version)")
 
 # --- INITIALIZE TOOLS ---
 tf = TimezoneFinder()
 vibe_cache = TTLCache(maxsize=2000, ttl=3600)
 
-# --- IN-MEMORY STORAGE ---
+# --- IN-MEMORY STORAGE (Replacing Postgres for quick testing) ---
 in_memory_reports = {}
 
 # --- PSYCHOLOGICAL ENGINE ---
@@ -54,43 +54,56 @@ def calculate_distance_miles(lat1, lon1, lat2, lon2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
-async def real_google_places_search(client: httpx.AsyncClient, query: str, lat: float, lng: float):
-    url = "https://places.googleapis.com/v1/places:searchText"
-    headers = {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": google_api_key,
-        "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.location"
+async def real_osm_search(client: httpx.AsyncClient, query: str, lat: float, lng: float):
+    """
+    Replaces Google Places with OpenStreetMap (Nominatim).
+    No API Key required.
+    """
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "q": query,
+        "format": "json",
+        "limit": 5,
+        "lat": lat,
+        "lon": lng,
+        "addressdetails": 1,
+        "extratags": 1
     }
-    payload = {
-        "textQuery": query,
-        "locationBias": {"circle": {"center": {"latitude": lat, "longitude": lng}, "radius": 10000.0}}
-    }
+    # Nominatim REQUIRES a User-Agent header or they will block the request.
+    headers = {"User-Agent": "LovaApp/1.0 (contact: your-email@example.com)"}
     
     try:
-        response = await client.post(url, headers=headers, json=payload)
+        response = await client.get(url, params=params, headers=headers)
         response.raise_for_status()
         data = response.json()
         
         results = []
-        # Defensive parsing: use .get() to prevent KeyErrors if Google returns partial data
-        for place in data.get("places", [])[:5]: 
-            name = place.get("displayName", {}).get("text", "Unknown Venue")
-            address = place.get("formattedAddress", "No address provided")
-            location = place.get("location", {})
-            p_lat = location.get("latitude", 0.0)
-            p_lng = location.get("longitude", 0.0)
+        for place in data:
+            p_lat = float(place.get("lat", 0.0))
+            p_lng = float(place.get("lon", 0.0))
             
+            # Extract clean address parts for BestTime API compatibility
+            addr = place.get("address", {})
+            road = addr.get("road", "")
+            house_number = addr.get("house_number", "")
+            city = addr.get("city") or addr.get("town") or addr.get("suburb", "")
+            
+            # Format: "123 Main St, New York"
+            clean_address = f"{house_number} {road}, {city}".strip(", ")
+            if not clean_address:
+                clean_address = place.get("display_name", "").split(",")[0]
+
             distance = calculate_distance_miles(lat, lng, p_lat, p_lng)
             results.append({
-                "name": name, 
-                "address": address,
+                "name": place.get("name") or place.get("display_name").split(',')[0], 
+                "address": clean_address,
                 "lat": p_lat,
                 "lng": p_lng,
                 "distance_miles": round(distance, 1)
             })
         return results
     except Exception as e:
-        logger.error(f"Google Places Error: {e}")
+        logger.error(f"OSM Search Error: {e}")
         return []
 
 async def get_single_vibe_forecast(client: httpx.AsyncClient, venue_name: str, venue_address: str, venue_lat: float, venue_lng: float, local_day: int, local_hour: int):
@@ -105,12 +118,12 @@ async def get_single_vibe_forecast(client: httpx.AsyncClient, venue_name: str, v
     busyness = 50 
     
     try:
-        response = await client.post(url, params=params, timeout=3.0)
+        # BestTime can be slow, using a 5s timeout
+        response = await client.post(url, params=params, timeout=5.0)
         if response.status_code == 200:
             raw_data = response.json()
             for day in raw_data.get("analysis", []):
                 if day.get("day_info", {}).get("day_int") == local_day:
-                    # Access safety: ensure hour index exists
                     raw_hours = day.get("day_raw", [])
                     if len(raw_hours) > local_hour:
                         busyness = raw_hours[local_hour]
@@ -118,9 +131,9 @@ async def get_single_vibe_forecast(client: httpx.AsyncClient, venue_name: str, v
     except Exception as e:
         logger.warning(f"BestTime fetch failed for {venue_name}: {e}")
 
-    # 2. Live Calibration from Crowd-sourced reports
+    # 2. Live Calibration
     adjustment = 0
-    if venue_address in in_memory_reports and in_memory_reports[venue_address]:
+    if venue_address in in_memory_reports:
         reports = in_memory_reports[venue_address]
         adjustment = sum(reports) / len(reports) 
 
@@ -137,20 +150,21 @@ async def get_single_vibe_forecast(client: httpx.AsyncClient, venue_name: str, v
 
 @app.get("/api/vibe-search")
 async def search_smart_vibes(query: str, lat: float, lng: float):
-    # Handle the "0.0, 0.0" coordinate case gracefully
+    # Handle the "0.0, 0.0" coordinate case
     if lat == 0.0 and lng == 0.0:
-        logger.warning("Search triggered with 0.0, 0.0 coordinates.")
+        logger.warning("Coordinates are 0.0, 0.0. Ensure Emulator GPS is set.")
 
     tz_str = tf.timezone_at(lng=lng, lat=lat)
     local_tz = pytz.timezone(tz_str) if tz_str else pytz.UTC
     local_time = datetime.now(local_tz)
     local_day, local_hour = local_time.weekday(), local_time.hour
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        nearby_venues = await real_google_places_search(client, query, lat, lng)
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # Use OpenStreetMap instead of Google
+        nearby_venues = await real_osm_search(client, query, lat, lng)
         
         if not nearby_venues:
-            raise HTTPException(status_code=404, detail="No venues found nearby. Try enabling GPS.")
+            raise HTTPException(status_code=404, detail="No venues found nearby. Try a different search term or check GPS.")
 
         tasks = [
             get_single_vibe_forecast(client, v["name"], v["address"], v["lat"], v["lng"], local_day, local_hour) 
@@ -177,36 +191,16 @@ async def search_smart_vibes(query: str, lat: float, lng: float):
         
         return {"nearest": nearest, "quietest": quietest}
 
-@app.get("/api/get-route")
-async def get_quiet_route(origin_lat: float, origin_lng: float, dest_lat: float, dest_lng: float):
-    url = "https://maps.googleapis.com/maps/api/directions/json"
-    params = {
-        "origin": f"{origin_lat},{origin_lng}", 
-        "destination": f"{dest_lat},{dest_lng}", 
-        "mode": "walking", 
-        "key": directions_api_key
-    }
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        response = await client.get(url, params=params)
-        data = response.json()
-        if data.get("status") == "OK":
-            return {"status": "success", "polyline": data["routes"][0]["overview_polyline"]["points"]}
-        
-        raise HTTPException(status_code=400, detail=f"Route failed: {data.get('status')}")
-
 @app.post("/api/vouch")
 async def submit_vouch(venue_address: str, impact: int):
-    # Save report
     if venue_address not in in_memory_reports:
         in_memory_reports[venue_address] = []
     in_memory_reports[venue_address].append(impact)
     
-    # Invalidate cache for this specific venue
     keys_to_remove = [k for k in vibe_cache.keys() if k.startswith(venue_address)]
     for k in keys_to_remove: 
         vibe_cache.pop(k, None)
         
-    # Return both status AND message to satisfy the Kotlin data model
     return {
         "status": "success", 
         "message": "Aura calibrated! The map will update shortly."
